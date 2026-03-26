@@ -1,0 +1,29 @@
+Projet_Federateur/
+│
+├── data/
+│   ├── raw/                # Original DICOM files (don't touch these)
+│   ├── processed/          # PNG versions of images & masks
+│   │   ├── train/          # Images for Phase 2 training
+│   │   │   ├── images/     # .png mammograms
+│   │   │   └── masks/      # .png tumor outlines
+│   │   └── test/           # Images the AI never sees (Phase 6)
+│   │       ├── images/
+│   │       └── masks/
+│   └── metadata.csv        # The original or filtered Excel/CSV file
+│
+├── models/                 # Where you save your AI after training
+│   └── unet_resnet34.pth   # The "saved brain" of your project
+│
+├── notebooks/              # For experiments (if you use Jupyter)
+│   └── data_exploration.ipynb
+│
+├── src/                    # Your Python source code
+│   ├── patientFetcher.py   # Your Step 1 script
+│   ├── model_builder.py    # The U-Net definition
+│   ├── train.py            # Phase 2: Training logic
+│   ├── measurement.py      # Phase 3: Pixel-to-mm logic
+│   └── utils.py            # Helper functions (DICOM conversion, etc.)
+│
+├── app.py                  # Phase 5: Your Streamlit Dashboard
+├── requirements.txt        # List of libraries (pandas, pydicom, smp)
+└── README.md               # Documentation and the Medical Disclaimer
