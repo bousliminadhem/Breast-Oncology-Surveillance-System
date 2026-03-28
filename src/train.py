@@ -38,8 +38,8 @@ def train_modality(mode):
     # mode='max' because we want to maximize the Dice Score
     # factor=0.1 means multiply LR by 0.1 (1e-4 becomes 1e-5)
     # patience=5 means wait 5 epochs of no improvement before dropping
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=5, verbose=True)
-
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=5)
+    
     best_dice = 0.0
     for epoch in range(epochs):
         model.train()
