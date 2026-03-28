@@ -1,82 +1,65 @@
 import torch
-import torch.optim as optim
-import argparse
-import os
+import torch.nn as nn
+from torch.utils.data import DataLoader, random_split
 import segmentation_models_pytorch as smp
-from torch.utils.data import DataLoader
 from dataset import MultiModalityDataset
-from tqdm import tqdm
+import os
 
 def train_modality(mode):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    os.makedirs("models", exist_ok=True)
+    device = torch.device("cuda")
     
-    # 1. SETTINGS
-    if mode == "us":
-        data_path, model_save_path = "data/processed_us", "models/ultrasound_best.pth"
-        initial_lr, epochs = 1e-4, 50
-    else:
-        data_path, model_save_path = "data/processed_mg", "models/mammography_best.pth"
-        initial_lr, epochs = 1e-4, 80 # MG needs more time to converge
-
-    # 2. DATA
-    train_loader = DataLoader(
-        MultiModalityDataset(f"{data_path}/train/images", f"{data_path}/train/masks", is_train=True),
-        batch_size=8, shuffle=True
-    )
-    val_loader = DataLoader(
-        MultiModalityDataset(f"{data_path}/test/images", f"{data_path}/test/masks", is_train=False),
-        batch_size=8, shuffle=False
-    )
-
-    # 3. MODEL & OPTIMIZER
+    # 1. Model
     model = smp.Unet(encoder_name="resnet34", in_channels=1, classes=1).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=initial_lr)
-    criterion = smp.losses.DiceLoss(mode='binary')
 
-    # --- THE SCHEDULER ---
-    # mode='max' because we want to maximize the Dice Score
-    # factor=0.1 means multiply LR by 0.1 (1e-4 becomes 1e-5)
-    # patience=5 means wait 5 epochs of no improvement before dropping
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=5)
+    # 2. Data Splitting (The "Best Result" Strategy)
+    full_dataset = MultiModalityDataset(
+        image_dir=f"data/processed_{mode}/train/images",
+        mask_dir=f"data/processed_{mode}/train/masks",
+        is_train=True
+    )
     
-    best_dice = 0.0
-    for epoch in range(epochs):
+    train_size = int(0.8 * len(full_dataset))
+    val_size = len(full_dataset) - train_size
+    train_ds, val_ds = random_split(full_dataset, [train_size, val_size])
+
+    train_loader = DataLoader(train_ds, batch_size=4, shuffle=True, num_workers=2, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=4, shuffle=False, num_workers=2, pin_memory=True)
+
+    # 3. Hybrid Loss for Medical Imaging
+    dice_loss = smp.losses.DiceLoss(mode='binary')
+    bce_loss = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+
+    # 4. Training Loop with "Best-Only" Saving
+    best_val_dice = 0.0
+    for epoch in range(40):
         model.train()
-        train_loss = 0
-        for imgs, masks in tqdm(train_loader, desc=f"Epoch {epoch+1}"):
+        for imgs, masks in train_loader:
             imgs, masks = imgs.to(device), masks.to(device)
+            outputs = model(imgs)
+            # Combined Loss: 50% Dice, 50% BCE
+            loss = 0.5 * dice_loss(outputs, masks) + 0.5 * bce_loss(outputs, masks)
+            
             optimizer.zero_grad()
-            loss = criterion(model(imgs), masks)
             loss.backward()
             optimizer.step()
-            train_loss += loss.item()
 
-        # Validation
+        # Validation Phase (Every Epoch)
         model.eval()
-        running_dice = 0
+        total_val_dice = 0
         with torch.no_grad():
             for imgs, masks in val_loader:
                 imgs, masks = imgs.to(device), masks.to(device)
-                outputs = model(imgs)
-                tp, fp, fn, tn = smp.metrics.get_stats(outputs, (masks > 0.5).int(), mode='binary', threshold=0.5)
-                running_dice += smp.metrics.f1_score(tp, fp, fn, tn, reduction="micro")
+                preds = (torch.sigmoid(model(imgs)) > 0.5).float()
+                # Simple Dice Calculation
+                intersect = (preds * masks).sum()
+                union = preds.sum() + masks.sum()
+                total_val_dice += (2. * intersect / (union + 1e-7)).item()
         
-        avg_dice = running_dice / len(val_loader)
-        
-        # --- UPDATE SCHEDULER ---
-        # It looks at the Dice score and decides if it needs to slow down
-        scheduler.step(avg_dice)
+        avg_val_dice = total_val_dice / len(val_loader)
+        print(f"Epoch {epoch+1} | Val Dice: {avg_val_dice:.4f}")
 
-        print(f"Epoch {epoch+1}: Loss={train_loss/len(train_loader):.4f} | Dice={avg_dice:.4f} | LR={optimizer.param_groups[0]['lr']}")
-
-        if avg_dice > best_dice:
-            best_dice = avg_dice
-            torch.save(model.state_dict(), model_save_path)
-            print("⭐ Best Weights Updated!")
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["us", "mg"], required=True)
-    args = parser.parse_args()
-    train_modality(args.mode)
+        if avg_val_dice > best_val_dice:
+            best_val_dice = avg_val_dice
+            torch.save(model.state_dict(), f"models/{mode}_best.pth")
+            print("🌟 New Best Model Saved!")
