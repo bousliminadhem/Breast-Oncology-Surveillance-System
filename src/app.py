@@ -11,12 +11,12 @@ st.set_page_config(page_title="Breast Oncology AI", layout="wide")
 
 MODELS = {
     "Ultrasound": {
-        "path": "models/ultrasound_best.pth",
+        "path": "models/us_best.pth",
         "use_clahe": True,
         "desc": "Optimized for Dataset 1 (Nodules & Cysts)"
     },
     "Mammography": {
-        "path": "models/mammography_best.pth",
+        "path": "models/mg_best.pth",
         "use_clahe": False,
         "desc": "Optimized for Dataset 2 (Masses & Calcifications)"
     }
@@ -28,9 +28,15 @@ def load_model(modality):
     config = MODELS[modality]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Initialize U-Net ResNet-34
-    model = smp.Unet(encoder_name="resnet34", in_channels=1, classes=1)
+    # CHANGE THIS LINE to include the attention type
+    model = smp.Unet(
+        encoder_name="resnet34", 
+        in_channels=1, 
+        classes=1,
+        decoder_attention_type="scse"  # <--- Add this!
+    )
     
+    # ... rest of the loading logic ...
     if os.path.exists(config["path"]):
         model.load_state_dict(torch.load(config["path"], map_location=device))
     
