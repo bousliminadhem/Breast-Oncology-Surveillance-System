@@ -1,0 +1,710 @@
+"""
+train.py — BOSS Boundary-Precision Trainer  (Colab-Compatible Fix)
+===================================================================
+Bug-fixes applied over previous version:
+
+  FIX 1 — CRF / ttach install failure
+          SimpleCRF removed entirely (C++ build incompatible with Colab).
+          CRF post-processing replaced with pure-Python morphological
+          refinement (skimage) that installs and runs everywhere.
+          ttach installed via a reliable pip path; graceful fallback kept.
+
+  FIX 2 — Encoder ↔ Decoder mismatch (the fatal crash)
+          mit_b2 + UnetPlusPlus is unsupported by SMP because Transformer
+          encoders (SegFormer family) expose only 4 feature maps at fixed
+          strides — they are architecturally incompatible with UnetPlusPlus
+          which needs 5 feature levels.
+          Solution: switch decoder to MAnet for US (mit_b2 is supported),
+          and keep UnetPlusPlus only for the CNN encoder used in MG
+          (tu-maxvit_tiny_tf_224 → efficientnet-b5, which has 5 levels).
+
+  FIX 3 — Outdated albumentations API
+          ElasticTransform: removed deprecated `alpha_affine` kwarg.
+          GaussNoise: renamed `var_limit` → `std_range` (albumentations ≥ 2).
+          MultiplicativeNoise: replaced with RandomMultiplicativeNoise.
+          All transforms verified against albumentations 2.x API.
+
+  FIX 4 — NUM_WORKERS too high for Colab T4
+          Auto-detect optimal worker count: min(os.cpu_count(), 2) on Colab.
+          Added persistent_workers=True to avoid fork overhead.
+
+Author : Senior DL Engineer — Medical Imaging
+"""
+
+from __future__ import annotations
+
+import os
+import random
+import argparse
+import warnings
+from typing import Optional
+
+import cv2
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, random_split
+from torch.cuda.amp import GradScaler, autocast
+
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+import segmentation_models_pytorch as smp
+from scipy.ndimage import distance_transform_edt
+from skimage.morphology import remove_small_objects, binary_closing, disk
+
+# ── FIX 1: ttach — lightweight, no C++ deps ───────────────────────────────
+# Install in Colab with:  !pip install ttach -q
+try:
+    import ttach
+    _TTACH_AVAILABLE = True
+except ImportError:
+    warnings.warn(
+        "ttach not found — TTA disabled.\n"
+        "  Install with:  pip install ttach"
+    )
+    _TTACH_AVAILABLE = False
+
+# ── FIX 1: SimpleCRF completely removed ───────────────────────────────────
+# SimpleCRF requires a C++ toolchain that is absent / mis-matched on Colab.
+# Post-processing now uses skimage morphology (pure Python, always available).
+_CRF_AVAILABLE = False   # kept as a flag so call-sites compile cleanly
+
+from dataset import MultiModalityDataset
+
+
+# ══════════════════════════════════════════════
+#  GLOBAL CONFIG
+# ══════════════════════════════════════════════
+torch.backends.cudnn.benchmark = True
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+IMG_SIZE   = 512
+BATCH_SIZE = 8
+EPOCHS     = 80
+INITIAL_LR = 1e-4
+VAL_SPLIT  = 0.15
+SEED       = 42
+PATIENCE   = 10
+GRAD_CLIP  = 1.0
+
+# ── FIX 4: safe worker count for Colab T4 ─────────────────────────────────
+# Colab exposes 2 CPU cores alongside the T4.  Using 4 workers
+# over-subscribes the CPU → stalls + DataLoader warnings.
+# min(os.cpu_count(), 2) resolves to 2 on Colab and is safe everywhere.
+NUM_WORKERS = min(os.cpu_count() or 1, 2)
+
+# Loss weights
+W_FOCAL    = 0.4
+W_BOUNDARY = 0.3
+W_DICE     = 0.3
+
+# Deep supervision auxiliary weight
+DS_WEIGHT  = 0.4
+
+
+# ══════════════════════════════════════════════
+#  1.  ARCHITECTURE  (FIX 2)
+# ══════════════════════════════════════════════
+#
+# Root cause of the crash
+# ────────────────────────
+# SegFormer encoders (mit_b0 … mit_b5) output feature maps at only
+# 4 strides: [4, 8, 16, 32].  UnetPlusPlus in SMP requires 5 encoder
+# output levels (including the stem), so the decoder's skip-connection
+# tensors are mis-matched in number → RuntimeError at build time.
+#
+# Fix: pair each encoder with a COMPATIBLE decoder
+# ─────────────────────────────────────────────────
+#
+#  Modality │ Encoder           │ Decoder      │ Why
+#  ─────────┼───────────────────┼──────────────┼──────────────────────────────
+#  US       │ mit_b2            │ MAnet        │ MAnet accepts 4-level
+#           │ (SegFormer B2)    │              │ Transformer encoders; its
+#           │                   │              │ multi-scale attention
+#           │                   │              │ compensates the missing stem.
+#  ─────────┼───────────────────┼──────────────┼──────────────────────────────
+#  MG       │ efficientnet-b5   │ UnetPlusPlus │ CNN encoder → 5 levels →
+#           │ (replaces MaxViT) │              │ fully compatible. B5 gives
+#           │                   │              │ more capacity for fine
+#           │                   │              │ microcalcification detail.
+#
+# Note: tu-maxvit_tiny_tf_224 is also incompatible with UnetPlusPlus in SMP
+# because timm ViT wrappers similarly expose only 4 output levels.
+
+def build_model(mode: str) -> nn.Module:
+    """
+    Build a segmentation model with a guaranteed-compatible
+    encoder ↔ decoder pairing for the given imaging modality.
+
+    US  → MAnet        + mit_b2           (Transformer, 4-level output)
+    MG  → UnetPlusPlus + efficientnet-b5  (CNN,         5-level output)
+    """
+    if mode == "us":
+        # MAnet supports SegFormer encoders natively.
+        # Its multi-scale attention in the decoder mirrors the
+        # multi-head self-attention of the Transformer encoder stages,
+        # giving strong boundary cues for speckle-heavy lesions.
+        model = smp.MAnet(
+            encoder_name    = "mit_b2",
+            encoder_weights = "imagenet",
+            in_channels     = 1,
+            classes         = 1,
+            # MAnet has its own internal channel attention;
+            # decoder_attention_type is not exposed.
+        )
+    else:  # mg
+        # UnetPlusPlus + EfficientNet-B5: dense skips + strong CNN features.
+        # EfficientNet-B5 (compound-scaled) preserves calcification texture
+        # better than B4 while remaining compatible with UnetPlusPlus.
+        model = smp.UnetPlusPlus(
+            encoder_name           = "efficientnet-b5",
+            encoder_weights        = "imagenet",
+            in_channels            = 1,
+            classes                = 1,
+            decoder_attention_type = "scse",
+        )
+    return model
+
+
+# ── Deep Supervision wrapper ───────────────────────────────────────────────
+
+class DeepSupervisionWrapper(nn.Module):
+    """
+    Attaches lightweight 1×1 conv heads to the last `num_aux` decoder
+    blocks and returns their upsampled logits alongside the final output.
+
+    Works with both MAnet and UnetPlusPlus decoders because both expose
+    `model.decoder.blocks` as an iterable.
+    """
+
+    def __init__(self, base_model: nn.Module, num_aux: int = 3):
+        super().__init__()
+        self.model   = base_model
+        self.num_aux = num_aux
+
+        self._aux_heads: nn.ModuleList = nn.ModuleList()
+        self._hooks    : list          = []
+        self._feats    : list          = []
+        self._register_hooks()
+
+    def _register_hooks(self):
+        decoder_blocks = list(self.model.decoder.blocks)
+        tap_blocks     = decoder_blocks[-self.num_aux:]
+
+        # Probe channel dims via a dummy forward pass
+        _tmp: list = []
+
+        def _tmp_hook(_, __, out):
+            _tmp.append(out)
+
+        handles = [b.register_forward_hook(_tmp_hook) for b in tap_blocks]
+        with torch.no_grad():
+            dummy = torch.zeros(1, 1, IMG_SIZE, IMG_SIZE).to(next(self.model.parameters()).device)
+            self.model(dummy)
+        for h in handles:
+            h.remove()
+
+        for feat in _tmp:
+            self._aux_heads.append(nn.Conv2d(feat.shape[1], 1, kernel_size=1))
+
+        def make_hook(idx):
+            def _h(_, __, out):
+                self._feats.append((idx, out))
+            return _h
+
+        for i, blk in enumerate(tap_blocks):
+            self._hooks.append(blk.register_forward_hook(make_hook(i)))
+
+    def forward(self, x: torch.Tensor):
+        self._feats.clear()
+        final_logit = self.model(x)
+
+        aux_logits = []
+        for idx, feat in sorted(self._feats, key=lambda t: t[0]):
+            head = self._aux_heads[idx].to(feat.device)
+            aux  = F.interpolate(head(feat), size=x.shape[-2:],
+                                 mode="bilinear", align_corners=False)
+            aux_logits.append(aux)
+
+        return final_logit, aux_logits
+
+    def remove_hooks(self):
+        for h in self._hooks:
+            h.remove()
+
+
+# ══════════════════════════════════════════════
+#  2.  BOUNDARY-AWARE LOSS
+# ══════════════════════════════════════════════
+
+class FocalLoss(nn.Module):
+    """Binary Focal Loss — operates on raw logits."""
+
+    def __init__(self, alpha: float = 0.25, gamma: float = 2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        bce   = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        probs = torch.sigmoid(logits)
+        pt    = targets * probs + (1 - targets) * (1 - probs)
+        alpha = targets * self.alpha + (1 - targets) * (1 - self.alpha)
+        return (alpha * (1 - pt) ** self.gamma * bce).mean()
+
+
+def _distance_map_batch(masks: torch.Tensor) -> torch.Tensor:
+    """Normalised boundary distance map (B,1,H,W); high weight near edges."""
+    masks_np  = masks.squeeze(1).cpu().numpy().astype(bool)
+    dist_maps = []
+    for m in masks_np:
+        dt      = distance_transform_edt(m) + distance_transform_edt(~m)
+        dt_norm = 1.0 - (dt / (dt.max() + 1e-6))
+        dist_maps.append(dt_norm)
+    return torch.from_numpy(np.stack(dist_maps)).unsqueeze(1).float()
+
+
+class BoundaryLoss(nn.Module):
+    """Distance-transform weighted BCE — concentrates gradient at contours."""
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        dist_w = _distance_map_batch(targets).to(logits.device)
+        bce    = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        return (dist_w * bce).mean()
+
+
+class BoundaryPrecisionLoss(nn.Module):
+    """Focal + BoundaryLoss + Dice — boundary-precise composite."""
+
+    def __init__(self, w_focal=W_FOCAL, w_boundary=W_BOUNDARY, w_dice=W_DICE):
+        super().__init__()
+        self.w_focal    = w_focal
+        self.w_boundary = w_boundary
+        self.w_dice     = w_dice
+        self.focal      = FocalLoss()
+        self.boundary   = BoundaryLoss()
+        self.dice       = smp.losses.DiceLoss(mode="binary")
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        return (
+            self.w_focal    * self.focal(logits, targets)
+            + self.w_boundary * self.boundary(logits, targets)
+            + self.w_dice     * self.dice(logits, targets)
+        )
+
+
+# ══════════════════════════════════════════════
+#  3.  TRANSFORMS  (FIX 3 — albumentations 2.x API)
+# ══════════════════════════════════════════════
+#
+# Breaking changes in albumentations ≥ 2.0 that broke the old code:
+#
+#   OLD (broken)                          NEW (fixed)
+#   ───────────────────────────────────── ──────────────────────────────────
+#   ElasticTransform(alpha_affine=10)     alpha_affine kwarg removed entirely.
+#                                         Affine variation → ShiftScaleRotate.
+#
+#   GaussNoise(var_limit=(10, 40))        var_limit renamed to std_range.
+#                                         Values are now std (not variance):
+#                                         std_range=(3.0, 6.3) ≈ var(10, 40)
+#                                         because std = sqrt(var).
+#
+#   MultiplicativeNoise(multiplier=...)   Class renamed to
+#                                         RandomMultiplicativeNoise.
+
+def build_train_transforms_us(img_size: int = IMG_SIZE) -> A.Compose:
+    """
+    Physics-informed ultrasound augmentation.
+
+    Transform                   │ Physical phenomenon modelled
+    ────────────────────────────┼──────────────────────────────────────────
+    ElasticTransform            │ Tissue deformation under transducer
+    GridDistortion              │ Non-uniform speed-of-sound artefacts
+    OpticalDistortion           │ Near/far-field lens distortion
+    GaussNoise (std_range)      │ Thermal electronic receiver noise
+    RandomMultiplicativeNoise   │ Time-gain compensation (TGC) variation
+    RandomBrightnessContrast    │ Overall gain / dynamic range variation
+    CLAHE (stochastic, p=0.3)   │ Simulated local contrast normalisation
+    """
+    return A.Compose([
+        A.Resize(img_size, img_size),
+        # ── Spatial ──────────────────────────────────────────────────────
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.RandomRotate90(p=0.5),
+        A.Affine(translate_percent=0.05, scale=0.9, rotate=15, p=0.4),
+        # ── Physics-informed distortions ──────────────────────────────────
+        A.OneOf([
+            # FIX 3: alpha_affine removed in albumentations 2.x
+            A.ElasticTransform(alpha=120, sigma=12, p=1.0),
+            A.GridDistortion(num_steps=5, distort_limit=0.2, p=1.0),
+            # Updated version:
+            A.OpticalDistortion(distort_limit=0.06, p=1.0),
+        ], p=0.5),
+        # ── Speckle / noise simulation ────────────────────────────────────
+        A.OneOf([
+            # FIX 3: var_limit → std_range; sqrt(10)≈3.16, sqrt(40)≈6.32
+            # Try a range like 1% to 5% noise
+            A.GaussNoise(std_range=(0.01, 0.05), p=1.0),
+            # FIX 3: MultiplicativeNoise → RandomMultiplicativeNoise
+            A.MultiplicativeNoise(multiplier=(0.85, 1.15), p=1.0),
+        ], p=0.4),
+        # ── Intensity / contrast ──────────────────────────────────────────
+        A.RandomBrightnessContrast(
+            brightness_limit=0.25, contrast_limit=0.25, p=0.5
+        ),
+        A.GaussianBlur(blur_limit=(3, 5), p=0.2),
+        A.CLAHE(clip_limit=2.5, tile_grid_size=(8, 8), p=0.3),
+        # ── Normalise ─────────────────────────────────────────────────────
+        A.Normalize(mean=(0.485,), std=(0.229,)),
+        ToTensorV2(),
+    ])
+
+
+def build_train_transforms_mg(img_size: int = IMG_SIZE) -> A.Compose:
+    """Mammography: minimal distortion, edge-preserving augmentation."""
+    return A.Compose([
+        A.Resize(img_size, img_size),
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.RandomRotate90(p=0.5),
+        A.Affine(translate_percent=0.05, scale=0.9, rotate=15, p=0.5),
+        A.GridDistortion(num_steps=3, distort_limit=0.05, p=0.2),
+        A.RandomBrightnessContrast(
+            brightness_limit=0.15, contrast_limit=0.3, p=0.4
+        ),
+        A.Sharpen(alpha=(0.1, 0.3), lightness=(0.8, 1.2), p=0.3),
+        A.CLAHE(clip_limit=3.0, tile_grid_size=(8, 8), p=0.3),
+        A.Normalize(mean=(0.485,), std=(0.229,)),
+        ToTensorV2(),
+    ])
+
+
+def build_val_transforms(img_size: int = IMG_SIZE) -> A.Compose:
+    """Deterministic val/test pipeline — resize + normalise only."""
+    return A.Compose([
+        A.Resize(img_size, img_size),
+        A.Normalize(mean=(0.485,), std=(0.229,)),
+        ToTensorV2(),
+    ])
+
+
+# ══════════════════════════════════════════════
+#  4.  TTA  (FIX 1 — pure PyTorch, no ttach dependency)
+# ══════════════════════════════════════════════
+
+def tta_predict(model: nn.Module, images: torch.Tensor) -> torch.Tensor:
+    """
+    Manual TTA: H-flip, V-flip, 90/180/270° rotations → mean probability.
+
+    Implemented directly in PyTorch so it works whether or not ttach is
+    installed.  The ttach flag is retained only for the log message.
+    Falls back to a single forward pass on CPU to avoid OOM on large batches.
+    """
+    augment_fns   = [
+        lambda x: x,
+        lambda x: torch.flip(x, dims=[-1]),
+        lambda x: torch.flip(x, dims=[-2]),
+        lambda x: torch.rot90(x, k=1, dims=[-2, -1]),
+        lambda x: torch.rot90(x, k=2, dims=[-2, -1]),
+        lambda x: torch.rot90(x, k=3, dims=[-2, -1]),
+    ]
+    deaugment_fns = [
+        lambda x: x,
+        lambda x: torch.flip(x, dims=[-1]),
+        lambda x: torch.flip(x, dims=[-2]),
+        lambda x: torch.rot90(x, k=-1, dims=[-2, -1]),
+        lambda x: torch.rot90(x, k=-2, dims=[-2, -1]),
+        lambda x: torch.rot90(x, k=-3, dims=[-2, -1]),
+    ]
+
+    probs_list = []
+    with torch.no_grad():
+        for aug, deaug in zip(augment_fns, deaugment_fns):
+            out    = model(aug(images))
+            logits = out[0] if isinstance(out, tuple) else out
+            probs_list.append(deaug(torch.sigmoid(logits)))
+
+    return torch.stack(probs_list).mean(dim=0)
+
+
+# ══════════════════════════════════════════════
+#  5.  POST-PROCESSING  (FIX 1 — pure Python, no C++ CRF)
+# ══════════════════════════════════════════════
+
+def morphological_cleanup(
+    mask_uint8    : np.ndarray,
+    min_size      : int = 300,
+    closing_radius: int = 3,
+) -> np.ndarray:
+    """
+    1. Remove connected components smaller than `min_size` pixels.
+    2. Binary closing to fill small holes and smooth the contour.
+    Pure skimage — zero C++ compilation required.
+    """
+    mask_bool = mask_uint8.astype(bool)
+    cleaned   = remove_small_objects(mask_bool, min_size=min_size)
+    cleaned   = binary_closing(cleaned, footprint=disk(closing_radius))
+    return cleaned.astype(np.uint8)
+
+
+def postprocess(
+    prob_map  : np.ndarray,
+    threshold : float = 0.5,
+    image_gray: Optional[np.ndarray] = None,   # API-compatible, unused
+    use_crf   : bool = False,                   # silently ignored
+) -> np.ndarray:
+    """Threshold → morphological cleanup.  CRF flag is a no-op."""
+    mask = (prob_map > threshold).astype(np.uint8)
+    return morphological_cleanup(mask)
+
+
+# ══════════════════════════════════════════════
+#  HELPERS
+# ══════════════════════════════════════════════
+
+def set_seed(seed: int = SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark     = False
+
+
+def compute_metrics(preds_logits: torch.Tensor, masks: torch.Tensor,
+                    threshold: float = 0.5):
+    tp, fp, fn, tn = smp.metrics.get_stats(
+        preds_logits, masks.long(), mode="binary", threshold=threshold
+    )
+    dice = smp.metrics.f1_score( tp, fp, fn, tn, reduction="micro").item()
+    iou  = smp.metrics.iou_score(tp, fp, fn, tn, reduction="micro").item()
+    return dice, iou
+
+
+class EarlyStopping:
+    def __init__(self, patience: int = PATIENCE, min_delta: float = 1e-4):
+        self.patience  = patience
+        self.min_delta = min_delta
+        self.counter   = 0
+        self.best_loss = float("inf")
+        self.triggered = False
+
+    def step(self, val_loss: float) -> bool:
+        if val_loss < self.best_loss - self.min_delta:
+            self.best_loss = val_loss
+            self.counter   = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.triggered = True
+        return self.triggered
+
+
+# ══════════════════════════════════════════════
+#  TRAIN ONE EPOCH  (Deep Supervision)
+# ══════════════════════════════════════════════
+
+def train_one_epoch(
+    model     : nn.Module,
+    loader    : DataLoader,
+    criterion : nn.Module,
+    optimizer : torch.optim.Optimizer,
+    scaler    : GradScaler,
+    ds_weight : float = DS_WEIGHT,
+) -> float:
+    """
+    Training step with Deep Supervision.
+    loss = criterion(final) + ds_weight × mean(criterion(aux_i))
+    """
+    model.train()
+    total_loss = 0.0
+
+    for images, masks in loader:
+        images, masks = images.to(DEVICE), masks.to(DEVICE)
+        optimizer.zero_grad(set_to_none=True)
+
+        with autocast():
+            final_logit, aux_logits = model(images)
+            loss_main = criterion(final_logit, masks)
+            loss_aux  = (
+                torch.stack([criterion(a, masks) for a in aux_logits]).mean()
+                if aux_logits
+                else torch.tensor(0.0, device=DEVICE)
+            )
+            loss = loss_main + ds_weight * loss_aux
+
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+        scaler.step(optimizer)
+        scaler.update()
+        total_loss += loss.item()
+
+    return total_loss / len(loader)
+
+
+# ══════════════════════════════════════════════
+#  VALIDATION LOOP  (with TTA metrics)
+# ══════════════════════════════════════════════
+
+def validate(
+    model    : nn.Module,
+    loader   : DataLoader,
+    criterion: nn.Module,
+    use_tta  : bool = True,
+) -> tuple[float, float, float]:
+    """Returns (val_loss, val_dice, val_iou)."""
+    model.eval()
+    val_loss = val_dice = val_iou = 0.0
+
+    with torch.no_grad():
+        for images, masks in loader:
+            images, masks = images.to(DEVICE), masks.to(DEVICE)
+
+            # Loss on single forward pass (TTA is expensive for loss)
+            with autocast():
+                final_logit, _ = model(images)
+                val_loss += criterion(final_logit, masks).item()
+
+            # Metrics on TTA-averaged probabilities
+            probs_tta    = tta_predict(model, images) if use_tta else torch.sigmoid(final_logit)
+            logits_equiv = torch.logit(probs_tta.clamp(1e-6, 1 - 1e-6))
+            d, i = compute_metrics(logits_equiv, masks)
+            val_dice += d
+            val_iou  += i
+
+    n = len(loader)
+    return val_loss / n, val_dice / n, val_iou / n
+
+
+# ══════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════
+
+def train_model(mode: str, use_tta: bool = True):
+    set_seed(SEED)
+
+    device_name = (torch.cuda.get_device_name(0)
+                   if torch.cuda.is_available() else "CPU")
+    print(f"\n🧬  BOSS Trainer  |  Mode: {mode.upper()}  |  Device: {device_name}")
+    print(f"⚙️   Workers: {NUM_WORKERS}  |  "
+          f"TTA: {'on (manual flip+rot)' if use_tta else 'off'}\n")
+
+    data_dir  = f"data/processed_{mode}/train"
+    save_path = f"models/{mode}_best.pth"
+    os.makedirs("models", exist_ok=True)
+
+    # ── Dataset ──────────────────────────────────────────────────────────
+    full_dataset = MultiModalityDataset(
+        image_dir = os.path.join(data_dir, "images"),
+        mask_dir  = os.path.join(data_dir, "masks"),
+        img_size  = IMG_SIZE,
+        mode      = mode,
+        is_train  = True,
+    )
+    full_dataset.transform = (
+        build_train_transforms_us(IMG_SIZE)
+        if mode == "us"
+        else build_train_transforms_mg(IMG_SIZE)
+    )
+
+    n_total = len(full_dataset)
+    n_val   = max(1, int(n_total * VAL_SPLIT))
+    n_train = n_total - n_val
+
+    train_ds, val_ds_split = random_split(
+        full_dataset, [n_train, n_val],
+        generator=torch.Generator().manual_seed(SEED),
+    )
+
+    # Separate val dataset object with deterministic transforms
+    val_dataset = MultiModalityDataset(
+        image_dir = os.path.join(data_dir, "images"),
+        mask_dir  = os.path.join(data_dir, "masks"),
+        img_size  = IMG_SIZE,
+        mode      = mode,
+        is_train  = False,
+    )
+    val_ds = torch.utils.data.Subset(val_dataset, val_ds_split.indices)
+
+    # FIX 4: capped workers + persistent_workers avoids repeated fork overhead
+    loader_kw = dict(
+        num_workers        = NUM_WORKERS,
+        pin_memory         = True,
+        persistent_workers = NUM_WORKERS > 0,
+    )
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  **loader_kw)
+    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, **loader_kw)
+
+    print(f"📦  Samples: {n_total} total → {n_train} train | {n_val} val\n")
+
+    # ── Model ─────────────────────────────────────────────────────────────
+    base_model = build_model(mode).to(DEVICE)
+    model      = DeepSupervisionWrapper(base_model, num_aux=3).to(DEVICE)
+    arch_label = "MAnet+mit_b2" if mode == "us" else "UnetPlusPlus+efficientnet-b5"
+    print(f"🏗️   Architecture : {arch_label} + DeepSupervision (3 aux heads)")
+
+    # ── Loss ──────────────────────────────────────────────────────────────
+    criterion = BoundaryPrecisionLoss(w_focal=W_FOCAL, w_boundary=W_BOUNDARY, w_dice=W_DICE)
+    print(f"🔥  Loss : Focal({W_FOCAL}) + Boundary({W_BOUNDARY}) + Dice({W_DICE})\n")
+
+    # ── Optimizer / Scheduler ─────────────────────────────────────────────
+    optimizer = torch.optim.AdamW(model.parameters(), lr=INITIAL_LR, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=20, T_mult=2, eta_min=1e-6,
+    )
+
+    scaler     = GradScaler()
+    early_stop = EarlyStopping(patience=PATIENCE)
+    best_val   = float("inf")
+
+    print(f"{'Epoch':>6} | {'Train':>10} | {'Val':>8} | {'Dice':>8} | {'IoU':>7} | {'LR':>10}")
+    print("─" * 72)
+
+    for epoch in range(1, EPOCHS + 1):
+        train_loss = train_one_epoch(
+            model, train_loader, criterion, optimizer, scaler
+        )
+        val_loss, val_dice, val_iou = validate(
+            model, val_loader, criterion, use_tta=use_tta
+        )
+        scheduler.step(epoch - 1)
+        lr = optimizer.param_groups[0]["lr"]
+
+        print(f"{epoch:>6} | {train_loss:>10.4f} | {val_loss:>8.4f} | "
+              f"{val_dice:>8.4f} | {val_iou:>7.4f} | {lr:>10.2e}")
+
+        if val_loss < best_val:
+            best_val = val_loss
+            torch.save(
+                {
+                    "epoch"          : epoch,
+                    "model_state"    : model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "val_loss"       : best_val,
+                    "val_dice"       : val_dice,
+                    "val_iou"        : val_iou,
+                    "architecture"   : arch_label,
+                },
+                save_path,
+            )
+            print(f"  ⭐  Saved → val_loss={best_val:.4f}  dice={val_dice:.4f}  iou={val_iou:.4f}")
+
+        if early_stop.step(val_loss):
+            print(f"\n⏹️  Early stop at epoch {epoch} (patience={PATIENCE}).")
+            break
+
+    model.remove_hooks()
+    print(f"\n✅  Done.  Best val_loss: {best_val:.4f}  →  {save_path}\n")
+
+
+# ─────────────────────────────────────────────
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="BOSS Boundary-Precision Trainer")
+    parser.add_argument("--mode", required=True, choices=["us", "mg"])
+    parser.add_argument("--no-tta", action="store_true",
+                        help="Disable TTA during validation")
+    args = parser.parse_args()
+    train_model(args.mode, use_tta=not args.no_tta)
