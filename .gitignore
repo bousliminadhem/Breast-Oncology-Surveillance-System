@@ -1,14 +1,16 @@
 # Environments
-.env
-.venv
+.venv/
 env/
 venv/
-ENV/
-env.bak/
-venv.bak/
 
-# Original entries
+# Python cache
+**/__pycache__/
+*.pyc
+
+# Data and Models (Heavy files)
 data/
-__pycache__/
-*.pth
-.ipynb_checkpoints/
+models/
+
+# System files
+.DS_Store
+Thumbs.db

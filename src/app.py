@@ -15,6 +15,8 @@ Author: Senior Medical Imaging Software Engineer
 from __future__ import annotations
 
 import os
+from pathlib import Path
+import re
 import warnings
 from typing import Optional
 
@@ -98,29 +100,70 @@ _MODE_CONFIG = {
     "Ultrasound (US)": {
         "encoder"      : "mit_b2",
         "architecture" : "MAnet",
-        "model_path"   : r"D:\Projet Fédérateur\AI\Breast Oncology Surveillance System\models\us_elite_best.pth",
+        "model_path"   : r"D:\Projet Fédérateur\AI\Breast Oncology Surveillance System\models\us_model.pth",
     },
     "Mammography (MG)": {
-        "encoder"      : "tu-maxvit_tiny_tf_224",
+        "encoder"      : "efficientnet-b4",
         "architecture" : "UnetPlusPlus",
-        "model_path"   : r"D:\Projet Fédérateur\AI\Breast Oncology Surveillance System\models\mg_best.pth",
+        "model_path"   : r"D:\Projet Fédérateur\AI\Breast Oncology Surveillance System\models\mg_model.pth",
     },
 }
 
 ENCODER    = _MODE_CONFIG[MODE]["encoder"]
 MODEL_PATH = _MODE_CONFIG[MODE]["model_path"]
 
-IMG_SIZE   = 512
+# ─── Resolution: 512px for both MG and US (mirrors train_mg.py / train.py)
+IMG_SIZE = 512
 
 
 # ═════════════════════════════════════════════
-#  INFERENCE TRANSFORM  (identical to train.py val pipeline)
+#  INFERENCE TRANSFORM  (must match training val pipeline EXACTLY)
 # ═════════════════════════════════════════════
-_INFER_TRANSFORM = A.Compose([
-    A.Resize(IMG_SIZE, IMG_SIZE),
-    A.Normalize(mean=(0.485,), std=(0.229,)),   # single-channel; matches train.py
-    ToTensorV2(),
-])
+
+# MG normalization constants (from dataset_mg.py)
+_MG_MEAN = (0.5,)
+_MG_STD  = (0.25,)
+
+# US normalization constants (from dataset.py / train.py)
+_US_MEAN = (0.485,)
+_US_STD  = (0.229,)
+
+
+def _apply_clahe(image_gray: np.ndarray, clip_limit: float = 2.0, grid: int = 8) -> np.ndarray:
+    """Apply CLAHE contrast enhancement (mirrors dataset_mg.py preprocessing)."""
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(grid, grid))
+    if image_gray.dtype != np.uint8:
+        image_gray = image_gray.astype(np.uint8)
+    return clahe.apply(image_gray)
+
+
+def _percentile_normalize(image: np.ndarray, low: float = 1.0, high: float = 99.0) -> np.ndarray:
+    """Percentile-based normalization to [0, 1] (mirrors dataset_mg.py)."""
+    p_low  = np.percentile(image, low)
+    p_high = np.percentile(image, high)
+    if p_high - p_low < 1e-6:
+        return np.zeros_like(image, dtype=np.float32)
+    clipped = np.clip(image, p_low, p_high)
+    return ((clipped - p_low) / (p_high - p_low)).astype(np.float32)
+
+
+def _get_infer_transform(mode: str) -> A.Compose:
+    """Build the inference transform matching the training val pipeline."""
+    if mode == "mg":
+        # MG: dataset_mg.py applies CLAHE + percentile norm BEFORE augmentations,
+        # then A.Normalize(mean=0.5, std=0.25, max_pixel_value=1.0)
+        return A.Compose([
+            A.Resize(IMG_SIZE, IMG_SIZE),
+            A.Normalize(mean=_MG_MEAN, std=_MG_STD, max_pixel_value=1.0),
+            ToTensorV2(),
+        ])
+    else:
+        # US: original pipeline
+        return A.Compose([
+            A.Resize(IMG_SIZE, IMG_SIZE),
+            A.Normalize(mean=_US_MEAN, std=_US_STD),
+            ToTensorV2(),
+        ])
 
 
 # ═════════════════════════════════════════════
@@ -131,7 +174,8 @@ def _build_base_model(architecture: str, encoder_name: str) -> nn.Module:
     """Rebuild the bare SMP model to match the training checkpoint.
 
     The checkpoint's ``architecture`` field may look like
-    ``"MAnet+mit_b2"`` or ``"UnetPlusPlus+tu-maxvit_tiny_tf_224"``.
+    ``"MAnet+mit_b2"``, ``"Unet+mit_b3"`` or
+    ``"UnetPlusPlus+tu-maxvit_tiny_tf_224"``.
     This helper receives the parsed architecture name and encoder
     string, and instantiates the correct SMP class.
     """
@@ -139,6 +183,9 @@ def _build_base_model(architecture: str, encoder_name: str) -> nn.Module:
 
     if arch_norm in {"unetplusplus", "unet++", "unet_plus_plus"}:
         ModelCls = smp.UnetPlusPlus
+        extra_kwargs = {"decoder_attention_type": "scse"}
+    elif arch_norm in {"unet", "u-net"}:
+        ModelCls = smp.Unet
         extra_kwargs = {"decoder_attention_type": "scse"}
     elif arch_norm in {"manet", "ma-net"}:
         ModelCls = smp.MAnet
@@ -178,6 +225,156 @@ def _strip_ds_prefix(state_dict: dict) -> dict:
     return new_sd
 
 
+def _resolve_checkpoint_path(configured_path: str, mode_key: str) -> str:
+    """Resolve a checkpoint path with safe fallbacks if the exact file is missing."""
+    if os.path.isfile(configured_path):
+        return configured_path
+
+    configured = Path(configured_path)
+    models_dir = configured.parent
+    if not models_dir.is_dir():
+        raise FileNotFoundError(
+            f"Model directory not found: {models_dir}"
+        )
+
+    all_pth = sorted(models_dir.glob("*.pth"))
+    if not all_pth:
+        raise FileNotFoundError(
+            f"No checkpoint files (.pth) found in {models_dir}"
+        )
+
+    def _norm_name(name: str) -> str:
+        # Normalize spacing/case so names like "mg _best.pth" match "mg_best.pth".
+        return "".join(name.lower().split())
+
+    wanted = _norm_name(configured.name)
+    for candidate in all_pth:
+        if _norm_name(candidate.name) == wanted:
+            return str(candidate)
+
+    if mode_key == "Mammography (MG)":
+        tagged = [p for p in all_pth if "mg" in p.name.lower()]
+    else:
+        tagged = [p for p in all_pth if "us" in p.name.lower()]
+
+    if tagged:
+        # Prefer the newest file when several checkpoints are available.
+        tagged.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return str(tagged[0])
+
+    available = ", ".join(p.name for p in all_pth)
+    raise FileNotFoundError(
+        f"Checkpoint not found: {configured_path}. Available: {available}"
+    )
+
+
+def _infer_architecture_from_state_dict(state_dict: dict) -> Optional[str]:
+    """Infer segmentation architecture from checkpoint parameter names."""
+    keys = state_dict.keys()
+
+    if any("decoder.blocks.x_0_0" in k for k in keys):
+        return "UnetPlusPlus"
+
+    if any(k.startswith("decoder.pab") for k in keys) or any(".pab." in k for k in keys):
+        return "MAnet"
+
+    if any(k.startswith("decoder.blocks.") for k in keys):
+        return "Unet"
+
+    return None
+
+
+def _infer_encoder_candidates_from_state_dict(state_dict: dict) -> list[str]:
+    """Infer likely encoder names from state_dict key patterns."""
+    keys = list(state_dict.keys())
+    candidates: list[str] = []
+
+    if any(k.startswith("encoder.model.stem.") for k in keys):
+        candidates.append("tu-maxvit_tiny_tf_224")
+
+    if any(k.startswith("encoder.patch_embed1.") for k in keys):
+        candidates.extend(["mit_b3", "mit_b2", "mit_b1", "mit_b4", "mit_b5"])
+
+    if any(k.startswith("encoder._conv_stem") for k in keys):
+        block_ids = []
+        for k in keys:
+            m = re.match(r"encoder\._blocks\.(\d+)\.", k)
+            if m:
+                block_ids.append(int(m.group(1)))
+
+        block_count = (max(block_ids) + 1) if block_ids else 0
+        if block_count >= 39:
+            eff_priority = ["efficientnet-b5", "efficientnet-b6", "efficientnet-b7", "efficientnet-b4"]
+        elif block_count >= 32:
+            eff_priority = ["efficientnet-b4", "efficientnet-b3", "efficientnet-b5", "efficientnet-b2"]
+        elif block_count >= 23:
+            eff_priority = ["efficientnet-b2", "efficientnet-b1", "efficientnet-b3", "efficientnet-b0"]
+        else:
+            eff_priority = ["efficientnet-b0", "efficientnet-b1", "efficientnet-b2", "efficientnet-b3"]
+        candidates.extend(eff_priority)
+
+    # Deduplicate while preserving order.
+    deduped: list[str] = []
+    for c in candidates:
+        if c not in deduped:
+            deduped.append(c)
+    return deduped
+
+
+def _load_with_best_match(
+    state_dict: dict,
+    arch_name: str,
+    encoder_name: str,
+    mode: str,
+) -> tuple[nn.Module, str, str]:
+    """Try a small set of architecture/encoder candidates and return the first strict match."""
+    inferred_arch = _infer_architecture_from_state_dict(state_dict)
+    inferred_encs = _infer_encoder_candidates_from_state_dict(state_dict)
+
+    arch_candidates = [arch_name]
+    if inferred_arch and inferred_arch not in arch_candidates:
+        arch_candidates.append(inferred_arch)
+
+    if mode == "mg":
+        for a in ["Unet", "UnetPlusPlus", "MAnet"]:
+            if a not in arch_candidates:
+                arch_candidates.append(a)
+    else:
+        for a in ["MAnet", "UnetPlusPlus", "Unet"]:
+            if a not in arch_candidates:
+                arch_candidates.append(a)
+
+    enc_candidates = [encoder_name]
+    for e in inferred_encs:
+        if e not in enc_candidates:
+            enc_candidates.append(e)
+
+    if mode == "mg":
+        for e in ["efficientnet-b4", "efficientnet-b3", "tu-maxvit_tiny_tf_224", "efficientnet-b5", "efficientnet-b0"]:
+            if e not in enc_candidates:
+                enc_candidates.append(e)
+    else:
+        for e in ["mit_b2", "mit_b3"]:
+            if e not in enc_candidates:
+                enc_candidates.append(e)
+
+    errors: list[str] = []
+    for arch_try in arch_candidates:
+        for enc_try in enc_candidates:
+            try:
+                model_try = _build_base_model(arch_try, enc_try)
+                model_try.load_state_dict(state_dict, strict=True)
+                return model_try, arch_try, enc_try
+            except Exception as exc:
+                errors.append(f"{arch_try}+{enc_try}: {exc}")
+
+    details = "\n".join(errors[:5])
+    raise RuntimeError(
+        "Could not match checkpoint weights to any tested architecture/encoder combination.\n"
+        f"First attempts:\n{details}"
+    )
+
+
 # ═════════════════════════════════════════════
 #  MODEL LOADER  (cached)
 # ═════════════════════════════════════════════
@@ -189,7 +386,11 @@ def load_boss_model(mode):
         cfg      = _MODE_CONFIG[mode_key]
 
         # 2. Load checkpoint first so we can infer architecture/encoder
-        checkpoint_path = cfg["model_path"]
+        checkpoint_path = _resolve_checkpoint_path(cfg["model_path"], mode_key)
+        if checkpoint_path != cfg["model_path"]:
+            st.sidebar.warning(
+                f"Configured checkpoint not found. Using fallback: {os.path.basename(checkpoint_path)}"
+            )
         checkpoint      = torch.load(checkpoint_path, map_location=DEVICE)
 
         # 3. Derive architecture and encoder from checkpoint metadata
@@ -197,10 +398,19 @@ def load_boss_model(mode):
         encoder_name = cfg.get("encoder", "mit_b2")
 
         if isinstance(checkpoint, dict):
+            # ── train_mg.py format: config sub-dict ──────────────────────
+            ckpt_config = checkpoint.get("config", {})
+            if isinstance(ckpt_config, dict):
+                if ckpt_config.get("architecture"):
+                    arch_name = ckpt_config["architecture"]
+                if ckpt_config.get("encoder"):
+                    encoder_name = ckpt_config["encoder"]
+
+            # ── Legacy format: top-level architecture/encoder fields ─────
             arch_field = checkpoint.get("architecture")
             enc_field  = checkpoint.get("encoder")
 
-            # Parse patterns like "MAnet+mit_b2"
+            # Parse patterns like "MAnet+mit_b2" or "Unet+mit_b3"
             if arch_field:
                 if "+" in arch_field:
                     base_arch, maybe_enc = arch_field.split("+", 1)
@@ -214,32 +424,43 @@ def load_boss_model(mode):
             if enc_field:
                 encoder_name = enc_field
 
-        # 4. Build the base SMP model with the resolved config
-        model = _build_base_model(arch_name, encoder_name)
-
-        # ── Extract state dict ───────────────────────────────────────────
-        if isinstance(checkpoint, dict) and "model_state" in checkpoint:
-            raw_sd = checkpoint["model_state"]
+        # ── Extract state dict (support multiple checkpoint formats) ──────
+        if isinstance(checkpoint, dict):
+            if "ema_state_dict" in checkpoint:
+                # Prefer EMA weights (smoother, better generalisation)
+                raw_sd = checkpoint["ema_state_dict"]
+            elif "model_state_dict" in checkpoint:
+                raw_sd = checkpoint["model_state_dict"]
+            elif "model_state" in checkpoint:
+                raw_sd = checkpoint["model_state"]
+            else:
+                raw_sd = checkpoint           # legacy: entire dict is state_dict
         else:
-            raw_sd = checkpoint           # legacy fallback
+            raw_sd = checkpoint
 
         # ── Strip the DeepSupervisionWrapper prefix ──────────────────────
         is_wrapped = any(k.startswith("model.") for k in raw_sd)
         state_dict = _strip_ds_prefix(raw_sd) if is_wrapped else raw_sd
 
-        # ── Load weights (strict=True ensures architecture match) ────────
-        missing, unexpected = model.load_state_dict(state_dict, strict=True)
-        if missing:
-            st.warning(f"⚠️ Missing keys in checkpoint: {missing}")
-        if unexpected:
-            st.warning(f"⚠️ Unexpected keys in checkpoint: {unexpected}")
+        # 4. Build and load with strict matching, trying compatible candidates.
+        model, loaded_arch, loaded_encoder = _load_with_best_match(
+            state_dict=state_dict,
+            arch_name=arch_name,
+            encoder_name=encoder_name,
+            mode=mode,
+        )
+
+        if loaded_arch != arch_name or loaded_encoder != encoder_name:
+            st.sidebar.info(
+                f"Auto-matched checkpoint to {loaded_arch}+{loaded_encoder}"
+            )
 
         model.to(DEVICE).eval()
 
         # Surface checkpoint metadata for transparency
         if isinstance(checkpoint, dict):
-            arch    = checkpoint.get("architecture", arch_name)
-            enc     = checkpoint.get("encoder",      encoder_name)
+            arch    = checkpoint.get("architecture", loaded_arch)
+            enc     = checkpoint.get("encoder",      loaded_encoder)
             v_dice  = checkpoint.get("val_dice",     float("nan"))
             v_iou   = checkpoint.get("val_iou",      float("nan"))
             epoch   = checkpoint.get("epoch",        "?")
@@ -247,6 +468,7 @@ def load_boss_model(mode):
                 f"✅ **Loaded:** {arch} + {enc}\n\n"
                 f"Epoch {epoch} · Val Dice `{v_dice:.4f}` · Val IoU `{v_iou:.4f}`"
             )
+            st.sidebar.caption(f"Checkpoint: {checkpoint_path}")
 
         return model
 
@@ -287,6 +509,8 @@ def crf_refine(
     image_gray: np.ndarray,
     prob_map  : np.ndarray,
     num_iters : int = 5,
+    sxy       : tuple = (80, 80),
+    srgb      : tuple = (13, 13, 13),
 ) -> np.ndarray:
     """
     Dense CRF refinement (pydensecrf).  Aligns the soft probability
@@ -298,6 +522,11 @@ def crf_refine(
         image_gray : uint8 grayscale array (H, W).
         prob_map   : float32 probability map in [0, 1], shape (H, W).
         num_iters  : Number of CRF mean-field iterations.
+        sxy        : Bilateral spatial std (x, y). Smaller = finer spatial precision.
+                     MG default: (40, 40) to align with high-res MG gradients.
+                     US default: (80, 80).
+        srgb       : Bilateral colour std (r, g, b). Smaller = tighter colour grouping.
+                     MG default: (5, 5, 5).  US default: (13, 13, 13).
     Returns:
         Refined probability map, float32, shape (H, W).
     """
@@ -316,7 +545,7 @@ def crf_refine(
 
     # Appearance (bilateral) term — rewards coherent colour + position
     d.addPairwiseBilateral(
-        sxy=(80, 80), srgb=(13, 13, 13),
+        sxy=sxy, srgb=srgb,
         rgbim=img_rgb, compat=10,
     )
     # Smoothness (Gaussian) term — penalises label roughness
@@ -334,12 +563,18 @@ def postprocess(
     use_crf     : bool  = False,
     min_size    : int   = 300,
     closing_radius: int = 3,
+    crf_sxy     : tuple = (80, 80),
+    crf_srgb    : tuple = (13, 13, 13),
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Full post-processing pipeline:
       1. Optional CRF boundary refinement (uses `image_gray`).
       2. Threshold to binary mask.
       3. Morphological cleanup (remove islands, close contours).
+
+    Args:
+        crf_sxy  : Bilateral spatial std for CRF. Use (40,40) for MG.
+        crf_srgb : Bilateral colour std for CRF. Use (5,5,5) for MG.
 
     Returns:
         refined_prob  : float32 probability map after optional CRF (H, W).
@@ -348,7 +583,10 @@ def postprocess(
     refined_prob = prob_map.copy()
 
     if use_crf and image_gray is not None:
-        refined_prob = crf_refine(image_gray, refined_prob)
+        refined_prob = crf_refine(
+            image_gray, refined_prob,
+            sxy=crf_sxy, srgb=crf_srgb,
+        )
 
     binary_mask = (refined_prob > threshold).astype(np.uint8)
     binary_mask = morphological_cleanup(
@@ -386,8 +624,19 @@ if uploaded_file is not None:
 
     orig_h, orig_w = orig_image.shape
 
-    # ── 3. Pre-process (identical to train.py val pipeline) ──────────────
-    transformed    = _INFER_TRANSFORM(image=orig_image, mask=np.zeros_like(orig_image))
+    # ── 3. Pre-process (identical to training val pipeline) ────────────────
+    if mode == "mg":
+        # MG pipeline (mirrors dataset_mg.py __getitem__):
+        #   1. CLAHE contrast enhancement
+        #   2. Percentile normalization → [0, 1]
+        #   3. A.Normalize(0.5, 0.25, max_pixel_value=1.0) + Resize + ToTensor
+        proc_image = _apply_clahe(orig_image)
+        proc_image = _percentile_normalize(proc_image)  # float32 [0, 1]
+    else:
+        proc_image = orig_image  # US: raw uint8, A.Normalize handles it
+
+    infer_transform = _get_infer_transform(mode)
+    transformed    = infer_transform(image=proc_image, mask=np.zeros_like(orig_image))
     input_tensor   = transformed["image"]           # float32 (1, H, W)
     input_tensor   = input_tensor.unsqueeze(0)      # → (1, 1, H, W)
 
@@ -405,26 +654,37 @@ if uploaded_file is not None:
         prob_map_tensor = torch.sigmoid(final_logit)   # [0,1]
 
     # ── 5. Squeeze probability map to numpy (H,W) ─────────────────────────
-    prob_map_512 = prob_map_tensor.squeeze().cpu().numpy()   # (512, 512) float32
+    prob_map_model = prob_map_tensor.squeeze().cpu().numpy()   # (IMG_SIZE, IMG_SIZE) float32
 
     # ── 6. CRF + morphological post-processing ────────────────────────────
-    # Resize the source image to 512×512 so CRF bilateral term is computed
-    # at the same resolution as the probability map.
-    image_512 = cv2.resize(orig_image, (IMG_SIZE, IMG_SIZE))
+    # Resize the source image to model resolution so the CRF bilateral term
+    # is computed at the same resolution as the probability map.
+    image_model = cv2.resize(orig_image, (IMG_SIZE, IMG_SIZE))
+
+    # MG: finer CRF parameters to exploit high-res gradient detail
+    # US: standard parameters (wide spatial/colour range for smoothing)
+    if mode == "mg":
+        crf_sxy  = (40, 40)
+        crf_srgb = (5, 5, 5)
+    else:
+        crf_sxy  = (80, 80)
+        crf_srgb = (13, 13, 13)
 
     with st.spinner("🔬 Applying post-processing…"):
-        refined_prob, mask_512 = postprocess(
-            prob_map    = prob_map_512,
-            image_gray  = image_512,
+        refined_prob, mask_model = postprocess(
+            prob_map    = prob_map_model,
+            image_gray  = image_model,
             threshold   = THRESHOLD,
             use_crf     = USE_CRF and _CRF_AVAILABLE,
             min_size    = int(MORPH_MIN_SIZE),
             closing_radius = int(MORPH_RADIUS),
+            crf_sxy     = crf_sxy,
+            crf_srgb    = crf_srgb,
         )
 
     # ── 7. Scale mask back to original resolution ─────────────────────────
     mask_orig = cv2.resize(
-        mask_512.astype(np.uint8),
+        mask_model.astype(np.uint8),
         (orig_w, orig_h),
         interpolation=cv2.INTER_NEAREST,    # preserve hard edges
     )
