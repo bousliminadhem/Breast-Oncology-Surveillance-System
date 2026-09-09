@@ -1,4 +1,4 @@
-# 🎗️ Breast Oncology Surveillance System (BOSS)
+# 🎗️ Breast Cancer Surveillance System
 
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.25+-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io/)
